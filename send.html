@@ -1,0 +1,5 @@
+<!doctype html><meta charset="utf-8"><script>
+(async()=>{if(window.parent===window)return;const n=["1-home","2-results","3-stores","4-greeting","5-reminders","iap-review-paywall"];const files=[];
+for(const x of n){const b=await (await fetch("shots/"+x+".png")).arrayBuffer();files.push({name:x+".png",b});}
+parent.postMessage({lo:1,files},"https://appstoreconnect.apple.com");})();
+</script>
