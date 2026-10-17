@@ -1,0 +1,236 @@
+// Cloudflare Worker: AI gift search for לא שכחתי (add more routes here for future apps).
+// Bindings: secret ANTHROPIC_API_KEY, KV namespace KV (usage counters; optional but recommended).
+// The API key never ships inside the app; the app only calls this worker.
+
+const MODEL = "claude-haiku-5-5";
+const MAX_SEARCHES = 5;          // web searches per AI call ($0.01 each) — the main cost driver
+const WANT = 12;                 // products per call: enough for scrolling without another paid call
+const CACHE_DAYS = 3;            // same quiz answers within 3 days → served from cache, costs nothing
+
+// Cost guards (fresh AI calls only; cache hits are free and unlimited).
+// One fresh call ≈ $0.055 (5 searches + ~35k tokens on Haiku).
+const LIMITS = {
+  free: { day: 1, month: 10 },     // worst case ≈ $0.55 per free user per month
+  premium: { day: 10, month: 40 }, // worst case ≈ $2.2 per premium user per month
+};
+const GLOBAL_DAY = 300;            // hard ceiling for the whole app ≈ $16/day
+
+const OCC = { b: "יום הולדת", a: "יום שנה / יום נישואין", v: "ולנטיין / ט״ו באב", j: "הפתעה בלי סיבה מיוחדת" };
+const STYLE = {
+  cozy: "ביתי/ת ומתפנק/ת", fashion: "אופנה וסטייל", exp: "חוויות, ספא או אדרנלין", tech: "גיימינג וטכנולוגיה",
+  romantic: "רומנטי/ת", sport: "ספורט", foodie: "אוכל ושתייה", creative: "יצירה ואומנות",
+};
+// Israeli stores (fast local delivery) and the international giants Israelis already trust.
+const IL_DOMAINS = [
+  "ksp.co.il", "ivory.co.il", "bug.co.il", "payngo.co.il", "lastprice.co.il", "zap.co.il", "buyme.co.il",
+  "terminalx.com", "factory54.co.il", "hamashbir365.co.il", "superpharm.co.il", "golfco.co.il", "foxhome.co.il",
+  "max.co.il", "home-center.co.il", "ace.co.il", "steimatzky.co.il", "shufersal.co.il", "adikastyle.com",
+  "castro.com", "renuar.co.il", "laline.co.il", "sabon.co.il", "pandora.net", "timberland.co.il", "nike.co.il",
+  "michalnegrin.com", "kravitz.co.il", "delta.co.il", "brands4u.co.il",
+];
+const INTL_DOMAINS = ["amazon.com", "ebay.com", "aliexpress.com", "iherb.com"];
+const IL_ONLY_DAYS = 21; // international shipping to Israel usually takes 2-4 weeks
+
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-App, X-Device, X-Tier",
+};
+const json = (obj, status = 200, extra = {}) => new Response(JSON.stringify(obj), { status, headers: { ...cors, "Content-Type": "application/json; charset=utf-8", ...extra } });
+
+export default {
+  async fetch(req, env, ctx) {
+    if (req.method === "OPTIONS") return new Response(null, { headers: cors });
+    const url = new URL(req.url);
+    if (url.pathname === "/health") return json({ ok: true, key: !!env.ANTHROPIC_API_KEY, kv: !!env.KV });
+    if (url.pathname !== "/v1/gifts" || req.method !== "POST") return json({ error: "not_found" }, 404);
+    if (req.headers.get("X-App") !== "loshachachti") return json({ error: "forbidden" }, 403);
+    if (!env.ANTHROPIC_API_KEY) return json({ error: "not_configured" }, 503);
+
+    let q;
+    try { q = await req.json(); } catch { return json({ error: "bad_json" }, 400); }
+    const to = q.to === "him" ? "him" : "her";
+    const occ = OCC[q.occ] ? q.occ : "j";
+    const st = (Array.isArray(q.st) ? q.st : []).filter(s => STYLE[s]).sort().slice(0, 4);
+    const budget = Math.max(50, Math.min(5000, Math.round(+q.budget || 500)));
+    const seen = (Array.isArray(q.exclude) ? q.exclude : []).map(String).slice(0, 30);
+    const days = q.days === null || q.days === undefined || !Number.isFinite(+q.days) ? null : Math.max(0, Math.round(+q.days));
+    const ilOnly = days !== null && days < IL_ONLY_DAYS;
+    const tier = req.headers.get("X-Tier") === "premium" ? "premium" : "free";
+    const device = (req.headers.get("X-Device") || "").replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40) || "anon";
+    const debug = q.debug === "lo-dbg";
+
+    // 1) Cache: identical answers in the last few days cost nothing.
+    const cacheKey = new Request(`https://cache.local/gifts/v3/${to}/${occ}/${st.join(",") || "-"}/${budget}/${ilOnly ? "il" : "mix"}`);
+    if (!seen.length && !debug) {
+      const hit = await caches.default.match(cacheKey);
+      if (hit) { const body = await hit.json(); return json({ ...body, cached: true, left: await left(env, device, tier) }); }
+    }
+
+    // 2) Usage limits for fresh (paid) calls.
+    const quota = await checkQuota(env, device, tier);
+    if (!quota.ok && !debug) return json({ error: "quota", scope: quota.scope, left: 0 }, 429);
+
+    try {
+      const { items, dbg } = await search(env.ANTHROPIC_API_KEY, { to, occ, st, budget, seen, days, ilOnly });
+      ctx.waitUntil(spend(env, device));
+      if (debug) return json({ items, ilOnly, dbg });
+      if (!items.length) return json({ error: "no_results" }, 502);
+      const body = { items, ilOnly };
+      if (!seen.length) ctx.waitUntil(caches.default.put(cacheKey, new Response(JSON.stringify(body), { headers: { "Cache-Control": `max-age=${CACHE_DAYS * 86400}` } })));
+      return json({ ...body, cached: false, left: Math.max(0, quota.left - 1) });
+    } catch (e) {
+      return json({ error: "upstream", detail: String(e.message || e).slice(0, 200) }, 502);
+    }
+  },
+};
+
+/* ---------- usage counters (KV) ---------- */
+const dayKey = () => new Date().toISOString().slice(0, 10);
+const monthKey = () => new Date().toISOString().slice(0, 7);
+async function counts(env, device) {
+  if (!env.KV) return { d: 0, m: 0, g: 0 };
+  const [d, m, g] = await Promise.all([env.KV.get(`d:${dayKey()}:${device}`), env.KV.get(`m:${monthKey()}:${device}`), env.KV.get(`g:${dayKey()}`)]);
+  return { d: +d || 0, m: +m || 0, g: +g || 0 };
+}
+async function checkQuota(env, device, tier) {
+  const L = LIMITS[tier], c = await counts(env, device);
+  if (c.g >= GLOBAL_DAY) return { ok: false, scope: "global", left: 0 };
+  if (c.d >= L.day) return { ok: false, scope: "day", left: 0 };
+  if (c.m >= L.month) return { ok: false, scope: "month", left: 0 };
+  return { ok: true, left: Math.min(L.day - c.d, L.month - c.m) };
+}
+async function left(env, device, tier) { const q = await checkQuota(env, device, tier); return q.ok ? q.left : 0; }
+async function spend(env, device) {
+  if (!env.KV) return;
+  const c = await counts(env, device);
+  await Promise.all([
+    env.KV.put(`d:${dayKey()}:${device}`, String(c.d + 1), { expirationTtl: 2 * 86400 }),
+    env.KV.put(`m:${monthKey()}:${device}`, String(c.m + 1), { expirationTtl: 35 * 86400 }),
+    env.KV.put(`g:${dayKey()}`, String(c.g + 1), { expirationTtl: 2 * 86400 }),
+  ]);
+}
+
+/* ---------- AI search ---------- */
+async function callClaude(key, body) {
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`anthropic ${r.status}: ${(await r.text()).slice(0, 150)}`);
+  return r.json();
+}
+
+async function search(key, { to, occ, st, budget, seen, days, ilOnly }) {
+  const who = to === "her" ? "לבת הזוג (אישה)" : "לבן הזוג (גבר)";
+  const styles = st.length ? st.map(s => STYLE[s]).join(", ") : "לא צוין";
+  const min = Math.round(budget * 0.35);
+  const prompt = `אתה עוזר קניות ישראלי מנוסה. מצא ${WANT} מתנות שאפשר לקנות עכשיו אונליין ${who}.
+אירוע: ${OCC[occ]}. תחומי עניין: ${styles}. תקציב: ${min}–${budget} ש״ח.
+${seen.length ? `כבר הוצגו (אל תחזור עליהם): ${seen.join(" | ")}.\n` : ""}כללים:
+- חובה להחזיר תוצאות: גם אם אין התאמה מושלמת, בחר את המתנות הכי מתאימות שמצאת. לעולם אל תחזיר רשימה ריקה.
+- רק עמודי מוצר ספציפיים (לא עמודי חיפוש או קטגוריה). את הכתובת העתק בדיוק מתוצאות החיפוש.
+${ilOnly
+  ? `- האירוע בעוד ${days} ימים, אין זמן למשלוח מחו״ל: רק חנויות ישראליות עם משלוח מהיר בארץ.`
+  : `- קודם כל חנויות ישראליות (לפחות שני שלישים מהתוצאות). מחו״ל רק אמזון, eBay, AliExpress או iHerb, ורק מוצרים ששולחים לישראל.`}
+- העדף מוצרים עם דירוג גבוה וביקורות רבות ומותגים מוכרים: מתנה שמרגישה איכותית ובטוחה, לא פריט אקראי.
+- חפש בשמות מוצרים ספציפיים ובשם החנות (למשל: ״בושם לאישה אייבורי״, ״מארז פינוק ללין״), כל חיפוש בזווית אחרת של תחומי העניין.
+- מגוון: לא יותר משלושה מוצרים מאותה חנות, ומוצרים שונים זה מזה.
+- price: מחיר בשקלים (אם בדולרים, כפול 3.7). rating: דירוג עד 5 אם ראית, אחרת null.
+- why: משפט אחד חם וקונקרטי בעברית למה זה יתאים. בטקסטים אל תשתמש במרכאות כפולות, רק ב-״.
+החזר בסוף רק JSON תקין:
+{"items":[{"title":"שם קצר בעברית","price":123,"rating":4.7,"store":"שם החנות","url":"https://...","why":"..."}]}`;
+
+  const body = {
+    model: MODEL,
+    max_tokens: 6000,
+    messages: [{ role: "user", content: prompt }],
+    tools: [{
+      type: "web_search_20260209", name: "web_search", max_uses: MAX_SEARCHES, allowed_callers: ["direct"],
+      allowed_domains: ilOnly ? IL_DOMAINS : IL_DOMAINS.concat(INTL_DOMAINS), user_location: { type: "approximate", timezone: "Asia/Jerusalem" },
+    }],
+  };
+
+  const found = new Set();
+  let text = "", last = null; const stops = [];
+  const absorb = msg => {
+    for (const b of msg.content || []) {
+      if (b.type === "web_search_tool_result" && Array.isArray(b.content)) b.content.forEach(x => x.url && found.add(norm(x.url)));
+      if (b.type === "text") { text += b.text; (b.citations || []).forEach(c => c.url && found.add(norm(c.url))); }
+    }
+  };
+  for (let turn = 0; turn < 3; turn++) {
+    const msg = await callClaude(key, body); last = msg; stops.push(msg.stop_reason); absorb(msg);
+    if (msg.stop_reason !== "pause_turn") break;
+    body.messages = [body.messages[0], { role: "assistant", content: msg.content }];
+  }
+  if (!/"items"/.test(text) && last) {
+    // The model searched but never wrote the list: ask for it, no more searches (cheap).
+    body.messages = [body.messages[0], { role: "assistant", content: last.content }, { role: "user", content: "עכשיו החזר את ה-JSON עם המתנות הכי מתאימות שמצאת בחיפוש. בלי חיפושים נוספים." }];
+    try { const m2 = await callClaude(key, body); stops.push("f:" + m2.stop_reason); absorb(m2); } catch (e) { stops.push("f:err"); }
+  }
+
+  const raw = parseItems(text);
+  const cand = raw
+    .filter(i => i && typeof i.url === "string" && /^https:\/\//.test(i.url) && i.title && allowedHost(i.url, ilOnly))
+    .filter(i => !(+i.price) || +i.price >= budget * 0.3);
+  // Verify each page exists and grab its photo, price and rating straight from the store page.
+  const pages = await Promise.all(cand.map(i => pageInfo(i.url)));
+  const out = [];
+  cand.forEach((i, k) => {
+    const p = pages[k];
+    const inSearch = found.has(norm(i.url)) || [...found].some(f => f.startsWith(norm(i.url)) || norm(i.url).startsWith(f));
+    if (p.status === 404 || p.status === 410) return;          // dead link
+    if (!(p.ok || inSearch)) return;                            // can't confirm it exists
+    const price = p.price || Math.round(+i.price) || null;
+    if (price && price > budget * 1.15) return;
+    out.push({
+      title: String(i.title).slice(0, 80), price,
+      rating: p.rating || (+i.rating > 0 && +i.rating <= 5 ? Math.round(+i.rating * 10) / 10 : null),
+      store: String(i.store || host(i.url)).slice(0, 30), url: i.url, image: p.image || null,
+      why: String(i.why || "").slice(0, 170), il: /\.co\.il$|^(terminalx|castro|adikastyle|michalnegrin)\.com$/.test(host(i.url)),
+    });
+  });
+  // Israeli stores first, then by rating.
+  out.sort((a, b) => (b.il - a.il) || ((b.rating || 0) - (a.rating || 0)));
+  return { items: out.slice(0, WANT), dbg: { stops, raw: raw.length, kept: out.length, text: text.slice(-1200) } };
+}
+
+function parseItems(text) {
+  const m = text.match(/\{[\s\S]*"items"[\s\S]*\}/);
+  if (!m) return [];
+  for (const s of [m[0], m[0].replace(/\\"/g, "״")]) { try { return JSON.parse(s).items || []; } catch {} }
+  // Last resort: pull out each object separately.
+  return [...m[0].matchAll(/\{[^{}]*"url"\s*:\s*"[^"]+"[^{}]*\}/g)].map(x => { try { return JSON.parse(x[0]); } catch { return null; } }).filter(Boolean);
+}
+
+async function pageInfo(url) {
+  try {
+    const r = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", "Accept-Language": "he-IL,he;q=0.9,en;q=0.8" },
+      redirect: "follow", signal: AbortSignal.timeout(5000), cf: { cacheTtl: 86400 },
+    });
+    if (!r.ok) return { ok: false, status: r.status };
+    const html = (await r.text()).slice(0, 400000);
+    const meta = p => { const x = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${p}["'][^>]*content=["']([^"']+)["']`, "i")) || html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]*(?:property|name)=["']${p}["']`, "i")); return x && x[1]; };
+    let image = meta("og:image") || meta("twitter:image") || (html.match(/"image"\s*:\s*\[?\s*"(https?:[^"]+)"/) || [])[1];
+    if (image) { try { image = new URL(image.replace(/&amp;/g, "&"), url).toString(); } catch { image = null; } }
+    if (image && !/^https:/.test(image)) image = null;
+    let price = +(meta("product:price:amount") || meta("og:price:amount") || 0) || null;
+    const cur = meta("product:price:currency") || meta("og:price:currency");
+    if (price && cur && /usd/i.test(cur)) price = Math.round(price * 3.7);
+    if (price && cur && !/ils|nis|usd/i.test(cur)) price = null;
+    const rv = (html.match(/"ratingValue"\s*:\s*"?([0-9.]+)/) || [])[1];
+    const rating = +rv > 0 && +rv <= 5 ? Math.round(+rv * 10) / 10 : null;
+    return { ok: true, status: r.status, image, price: price ? Math.round(price) : null, rating };
+  } catch { return { ok: false, status: 0 }; }
+}
+
+function allowedHost(u, ilOnly) {
+  const h = host(u);
+  const list = ilOnly ? IL_DOMAINS : IL_DOMAINS.concat(INTL_DOMAINS);
+  return list.some(d => h === d || h.endsWith("." + d));
+}
+const norm = u => { try { const x = new URL(u); return (x.hostname.replace(/^www\./, "") + x.pathname).replace(/\/$/, ""); } catch { return u; } };
+const host = u => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } };
